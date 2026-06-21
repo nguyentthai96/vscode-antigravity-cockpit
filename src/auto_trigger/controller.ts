@@ -1315,6 +1315,20 @@ class AutoTriggerController {
     async syncToClientAccountOnStartup(): Promise<'switched' | 'same' | 'not_found' | 'not_exists'> {
         return this.withAccountLock(async () => {
             try {
+                // Guard: if plugin already has a valid active account (previously switched),
+                // don't override from local client. This protects against state.vscdb
+                // not reflecting the account switch (e.g. if DB persist failed).
+                const existingActive = await credentialStorage.getActiveAccount();
+                if (existingActive) {
+                    const existingCredential = await credentialStorage.getCredentialForAccount(existingActive);
+                    if (existingCredential?.refreshToken) {
+                        logger.info(
+                            `[AutoTriggerController] Startup sync: keeping existing active account: ${existingActive} (has valid credential)`,
+                        );
+                        return 'same';
+                    }
+                }
+
                 let currentEmail: string | null = null;
                 const source = 'local' as const;
                 

@@ -212,6 +212,145 @@ function parseUnifiedOAuthTokenInfo(stateValue: string): LocalTokenInfo {
     return parseOAuthTokenInfo(oauthInfoRaw);
 }
 
+// ============================================================================
+// Protobuf Encoder (reverse of parse functions above)
+// ============================================================================
+
+function writeVarintBytes(value: number): Buffer {
+    if (value === 0) {
+        return Buffer.from([0]);
+    }
+    const bytes: number[] = [];
+    let v = value;
+    while (v > 0) {
+        let byte = v & 0x7f;
+        v = Math.floor(v / 128); // Math.floor instead of >>> for large numbers
+        if (v > 0) {
+            byte |= 0x80;
+        }
+        bytes.push(byte);
+    }
+    return Buffer.from(bytes);
+}
+
+function writeStringField(fieldNum: number, value: string): Buffer {
+    const tag = writeVarintBytes((fieldNum << 3) | 2);
+    const data = Buffer.from(value, 'utf-8');
+    const len = writeVarintBytes(data.length);
+    return Buffer.concat([tag, len, data]);
+}
+
+function writeMessageField(fieldNum: number, content: Buffer): Buffer {
+    const tag = writeVarintBytes((fieldNum << 3) | 2);
+    const len = writeVarintBytes(content.length);
+    return Buffer.concat([tag, len, content]);
+}
+
+function writeVarintField(fieldNum: number, value: number): Buffer {
+    const tag = writeVarintBytes((fieldNum << 3) | 0);
+    const val = writeVarintBytes(value);
+    return Buffer.concat([tag, val]);
+}
+
+/**
+ * Build OAuthTokenInfo protobuf (reverse of parseOAuthTokenInfo)
+ * Fields: 1=accessToken, 2=tokenType, 3=refreshToken, 4=expiry{1=seconds}
+ */
+function buildOAuthTokenInfoProto(info: LocalTokenInfo): Buffer {
+    const parts: Buffer[] = [];
+    if (info.accessToken) {
+        parts.push(writeStringField(1, info.accessToken));
+    }
+    if (info.tokenType) {
+        parts.push(writeStringField(2, info.tokenType));
+    }
+    if (info.refreshToken) {
+        parts.push(writeStringField(3, info.refreshToken));
+    }
+    if (info.expirySeconds !== undefined && info.expirySeconds > 0) {
+        const timestampContent = writeVarintField(1, info.expirySeconds);
+        parts.push(writeMessageField(4, timestampContent));
+    }
+    return Buffer.concat(parts);
+}
+
+/**
+ * Build unified OAuth state value (reverse of parseUnifiedOAuthTokenInfo)
+ * Structure: base64( outer{ field1=message{ field1="oauthTokenInfoSentinelKey", field2=message{ field1=base64(oauthTokenInfoProto) } } } )
+ */
+function buildUnifiedOAuthState(info: LocalTokenInfo): string {
+    // 1. Build OAuthTokenInfo protobuf and base64 encode
+    const oauthInfoProto = buildOAuthTokenInfoProto(info);
+    const oauthInfoB64 = oauthInfoProto.toString('base64');
+
+    // 2. Build inner2: field 1 = oauthInfoB64 (string)
+    const inner2 = writeStringField(1, oauthInfoB64);
+
+    // 3. Build inner: field 1 = sentinel, field 2 = inner2 (message)
+    const sentinel = writeStringField(1, 'oauthTokenInfoSentinelKey');
+    const inner2Message = writeMessageField(2, inner2);
+    const inner = Buffer.concat([sentinel, inner2Message]);
+
+    // 4. Build outer: field 1 = inner (message)
+    const outer = writeMessageField(1, inner);
+
+    // 5. Base64 encode
+    return outer.toString('base64');
+}
+
+/**
+ * Write a value to state.vscdb ItemTable
+ */
+async function writeStateValueByKey(dbPath: string, key: string, value: string): Promise<void> {
+    if (!fs.existsSync(dbPath)) {
+        throw new Error(`Database file not found: ${dbPath}`);
+    }
+
+    const SQL = await getSqlJs();
+    const fileBuffer = fs.readFileSync(dbPath);
+    let db: Database | null = null;
+
+    try {
+        db = new SQL.Database(fileBuffer);
+        db.run('INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)', [key, value]);
+
+        // Write back to file
+        const data = db.export();
+        const buffer = Buffer.from(data);
+        fs.writeFileSync(dbPath, buffer);
+    } finally {
+        if (db) {
+            db.close();
+        }
+    }
+}
+
+/**
+ * Write OAuth token info to state.vscdb (unified key)
+ * This persists the switched account's token so Antigravity loads it on restart.
+ */
+export async function writeOAuthTokenToStateDb(info: {
+    accessToken: string;
+    refreshToken: string;
+    tokenType?: string;
+    expirySeconds: number;
+}): Promise<void> {
+    const dbPath = getAntigravityStateDbPath();
+    logger.info(`[LocalAuth] Writing OAuth token to state.vscdb: ${dbPath}`);
+
+    const tokenInfo: LocalTokenInfo = {
+        accessToken: info.accessToken,
+        refreshToken: info.refreshToken,
+        tokenType: info.tokenType || 'Bearer',
+        expirySeconds: info.expirySeconds,
+    };
+
+    const stateValue = buildUnifiedOAuthState(tokenInfo);
+    await writeStateValueByKey(dbPath, UNIFIED_STATE_KEY, stateValue);
+
+    logger.info('[LocalAuth] OAuth token persisted to state.vscdb successfully');
+}
+
 async function hasStateValueForKey(dbPath: string, key: string): Promise<boolean> {
     try {
         await readStateValueByKey(dbPath, key);

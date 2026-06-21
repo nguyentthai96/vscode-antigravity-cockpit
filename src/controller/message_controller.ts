@@ -1064,7 +1064,7 @@ export class MessageController {
                         });
                         const execution = await this.executeAccountSwitch({
                             targetEmail: email,
-                            switchMode: 'default',
+                            switchMode: 'seamless',
                             triggerType: 'manual',
                             triggerSource: 'webview.accounts.switchAccount',
                         });
@@ -1082,6 +1082,20 @@ export class MessageController {
                             logger.info(
                                 `[MsgCtrl] switchAccount completed with marker update: target=${email}, current=${switchedEmail}, mode=${execution.effectiveMode}`,
                             );
+                            // Seamless mode: prompt user to reload so IDE account icon updates
+                            if (accountSwitchService.isSeamlessMode(execution.effectiveMode)) {
+                                logger.info('[MsgCtrl] Seamless switch done, prompting user to reload window');
+                                const reloadAction = 'Reload Now';
+                                const laterAction = 'Later';
+                                const choice = await vscode.window.showInformationMessage(
+                                    `Account switched to ${switchedEmail}. Reload window to update the account icon?`,
+                                    reloadAction,
+                                    laterAction,
+                                );
+                                if (choice === reloadAction) {
+                                    vscode.commands.executeCommand('workbench.action.reloadWindow');
+                                }
+                            }
                         } else if (execution.errorCode === 'tools_offline' && execution.effectiveMode === 'default') {
                             this.hud.sendMessage({
                                 type: 'actionResult',
