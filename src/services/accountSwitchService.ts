@@ -294,6 +294,22 @@ class AccountSwitchService {
                 }
             }
 
+            // Persist to state.vscdb so Antigravity loads this account on restart
+            try {
+                const { writeOAuthTokenToStateDb } = await import('../auto_trigger/local_auth_importer');
+                await writeOAuthTokenToStateDb({
+                    accessToken,
+                    refreshToken: credential.refreshToken,
+                    tokenType: 'Bearer',
+                    expirySeconds: Math.floor(expiryMs / 1000),
+                });
+                logger.info(`[AccountSwitchService] Persisted token to state.vscdb for ${resolvedEmail}`);
+            } catch (persistError) {
+                const err = persistError instanceof Error ? persistError.message : String(persistError);
+                logger.warn(`[AccountSwitchService] Failed to persist to state.vscdb: ${err}`);
+                // Non-fatal: seamless switch still works for current session
+            }
+
             await credentialStorage.setActiveAccount(resolvedEmail, true);
             logger.info(
                 `[AccountSwitchService] Seamless switch success: ${activeBefore ?? 'none'} -> ${resolvedEmail}`,
