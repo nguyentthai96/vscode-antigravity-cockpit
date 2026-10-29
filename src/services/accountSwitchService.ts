@@ -294,16 +294,21 @@ class AccountSwitchService {
                 }
             }
 
-            // Persist to state.vscdb so Antigravity loads this account on restart
+            // Persist full account state to state.vscdb so Antigravity loads this account on restart
+            // Writes: oauthToken (preserving authState), userStatus, enterprisePreferences, onboarding
             try {
-                const { writeOAuthTokenToStateDb } = await import('../auto_trigger/local_auth_importer');
-                await writeOAuthTokenToStateDb({
+                const { writeFullAccountState } = await import('../auto_trigger/local_auth_importer');
+                await writeFullAccountState({
                     accessToken,
                     refreshToken: credential.refreshToken,
                     tokenType: 'Bearer',
                     expirySeconds: Math.floor(expiryMs / 1000),
+                    email: resolvedEmail,
+                    isGcpTos: false,
+                    projectId: credential.projectId,
+                    targetIde: 'ide',
                 });
-                logger.info(`[AccountSwitchService] Persisted token to state.vscdb for ${resolvedEmail}`);
+                logger.info(`[AccountSwitchService] Persisted full account state to state.vscdb for ${resolvedEmail}`);
             } catch (persistError) {
                 const err = persistError instanceof Error ? persistError.message : String(persistError);
                 logger.warn(`[AccountSwitchService] Failed to persist to state.vscdb: ${err}`);

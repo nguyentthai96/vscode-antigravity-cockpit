@@ -7,7 +7,7 @@ import { credentialStorage } from './credential_storage';
 import { oauthService } from './oauth_service';
 import { OAuthCredential } from './types';
 import { logger } from '../shared/log_service';
-import { getAntigravityStateDbPath, getAntigravityUserDataDir } from '../shared/antigravity_paths';
+import { getAntigravityStateDbPath, getAntigravityUserDataDir, getStateDbPathForTarget, TargetIdeType } from '../shared/antigravity_paths';
 
 const LEGACY_STATE_KEY = 'jetskiStateSync.agentManagerInitState';
 const UNIFIED_STATE_KEY = 'antigravityUnifiedStateSync.oauthToken';
@@ -35,6 +35,8 @@ interface LocalTokenInfo {
     refreshToken?: string;
     tokenType?: string;
     expirySeconds?: number;
+    idToken?: string;
+    isGcpTos?: boolean;
 }
 
 interface PendingLocalCredential {
@@ -254,48 +256,169 @@ function writeVarintField(fieldNum: number, value: number): Buffer {
 
 /**
  * Build OAuthTokenInfo protobuf (reverse of parseOAuthTokenInfo)
- * Fields: 1=accessToken, 2=tokenType, 3=refreshToken, 4=expiry{1=seconds}
+ * Fields: 1=accessToken, 2=tokenType, 3=refreshToken, 4=expiry{1=seconds, 2=nanos}, 5=idToken, 6=isGcpTos
+ * Aligned with Antigravity-Manager's protobuf::create_oauth_info
  */
 function buildOAuthTokenInfoProto(info: LocalTokenInfo): Buffer {
     const parts: Buffer[] = [];
+    // Field 1: access_token
     if (info.accessToken) {
         parts.push(writeStringField(1, info.accessToken));
     }
+    // Field 2: token_type = "Bearer"
     if (info.tokenType) {
         parts.push(writeStringField(2, info.tokenType));
     }
+    // Field 3: refresh_token
     if (info.refreshToken) {
         parts.push(writeStringField(3, info.refreshToken));
     }
+    // Field 4: expiry (Timestamp{seconds, nanos=0})
     if (info.expirySeconds !== undefined && info.expirySeconds > 0) {
-        const timestampContent = writeVarintField(1, info.expirySeconds);
+        const timestampContent = Buffer.concat([
+            writeVarintField(1, info.expirySeconds),
+            writeVarintField(2, 0), // nanos = 0 (aligned with Manager)
+        ]);
         parts.push(writeMessageField(4, timestampContent));
+    }
+    // Field 5: id_token (optional)
+    if (info.idToken) {
+        parts.push(writeStringField(5, info.idToken));
+    }
+    // Field 6: is_gcp_tos (varint boolean, only if true)
+    if (info.isGcpTos) {
+        parts.push(writeVarintField(6, 1));
     }
     return Buffer.concat(parts);
 }
 
+// ============================================================================
+// Unified Topic Entry helpers (aligned with Manager's protobuf module)
+// ============================================================================
+
 /**
- * Build unified OAuth state value (reverse of parseUnifiedOAuthTokenInfo)
- * Structure: base64( outer{ field1=message{ field1="oauthTokenInfoSentinelKey", field2=message{ field1=base64(oauthTokenInfoProto) } } } )
+ * Create a unified topic entry: Field 1 = message{ Field 1 = sentinelKey, Field 2 = message{ Field 1 = base64(payload) } }
+ * Aligned with Manager's protobuf::create_unified_topic_entry
  */
-function buildUnifiedOAuthState(info: LocalTokenInfo): string {
-    // 1. Build OAuthTokenInfo protobuf and base64 encode
+function createUnifiedTopicEntry(sentinelKey: string, payload: Buffer): Buffer {
+    const payloadB64 = payload.toString('base64');
+    const row = writeStringField(1, payloadB64);
+    const entry = Buffer.concat([
+        writeStringField(1, sentinelKey),
+        writeMessageField(2, row),
+    ]);
+    return writeMessageField(1, entry);
+}
+
+/**
+ * Create a unified state entry (for userStatus/enterprisePreferences).
+ * Structure: base64( Field 1 = message{ Field 1 = sentinelKey, Field 2 = message{ Field 1 = base64(payload) } } )
+ * Aligned with Manager's protobuf::create_unified_state_entry
+ */
+function createUnifiedStateEntry(sentinelKey: string, payload: Buffer): string {
+    const entry = createUnifiedTopicEntry(sentinelKey, payload);
+    return entry.toString('base64');
+}
+
+/**
+ * Extract the sentinel key from a topic entry's Field 1 sub-message.
+ * Returns the key string or undefined if not parseable.
+ */
+function getTopicEntrySentinelKey(data: Buffer): string | undefined {
+    const inner = findField(data, 1);
+    return inner?.toString('utf-8');
+}
+
+/**
+ * Remove a specific topic entry from topic data by sentinel key.
+ * Preserves all other entries in the topic.
+ * Aligned with Manager's protobuf::remove_unified_topic_entry
+ */
+function removeUnifiedTopicEntry(data: Buffer, targetKey: string): Buffer {
+    const result: Buffer[] = [];
+    let offset = 0;
+
+    while (offset < data.length) {
+        const startOffset = offset;
+        let tag: number;
+        let newOffset: number;
+        try {
+            [tag, newOffset] = readVarint(data, offset);
+        } catch {
+            break;
+        }
+        const wireType = tag & 7;
+        const fieldNum = tag >> 3;
+        const nextOffset = skipField(data, newOffset, wireType);
+
+        let shouldRemove = false;
+        if (fieldNum === 1 && wireType === 2) {
+            const [length, contentOffset] = readVarint(data, newOffset);
+            const entryData = data.subarray(contentOffset, contentOffset + length);
+            const entryKey = getTopicEntrySentinelKey(entryData);
+            if (entryKey === targetKey) {
+                shouldRemove = true;
+            }
+        }
+
+        if (!shouldRemove) {
+            result.push(data.subarray(startOffset, nextOffset));
+        }
+        offset = nextOffset;
+    }
+
+    return Buffer.concat(result);
+}
+
+/**
+ * Build unified OAuth state value with topic entry preservation.
+ * Reads existing topic data, removes old oauthTokenInfoSentinelKey entry, adds new one.
+ * This preserves authStateWithContextSentinelKey and other IDE-managed entries.
+ * Aligned with Manager's inject_new_format logic.
+ */
+function buildUnifiedOAuthStatePreserving(info: LocalTokenInfo, existingTopicB64?: string): string {
+    // 1. Build OAuthTokenInfo protobuf
     const oauthInfoProto = buildOAuthTokenInfoProto(info);
-    const oauthInfoB64 = oauthInfoProto.toString('base64');
 
-    // 2. Build inner2: field 1 = oauthInfoB64 (string)
-    const inner2 = writeStringField(1, oauthInfoB64);
+    // 2. Build new topic entry for oauthTokenInfoSentinelKey
+    const newEntry = createUnifiedTopicEntry('oauthTokenInfoSentinelKey', oauthInfoProto);
 
-    // 3. Build inner: field 1 = sentinel, field 2 = inner2 (message)
-    const sentinel = writeStringField(1, 'oauthTokenInfoSentinelKey');
-    const inner2Message = writeMessageField(2, inner2);
-    const inner = Buffer.concat([sentinel, inner2Message]);
+    // 3. If existing topic data exists, remove old entry and merge
+    let topicData: Buffer;
+    if (existingTopicB64) {
+        try {
+            const existingTopic = Buffer.from(existingTopicB64, 'base64');
+            const cleaned = removeUnifiedTopicEntry(existingTopic, 'oauthTokenInfoSentinelKey');
+            topicData = Buffer.concat([cleaned, newEntry]);
+        } catch {
+            // If parsing fails, create fresh topic with just this entry
+            topicData = newEntry;
+        }
+    } else {
+        topicData = newEntry;
+    }
 
-    // 4. Build outer: field 1 = inner (message)
-    const outer = writeMessageField(1, inner);
+    // 4. Base64 encode the full topic
+    return topicData.toString('base64');
+}
 
-    // 5. Base64 encode
-    return outer.toString('base64');
+/**
+ * Create minimal UserStatus payload (email at Field 3 + Field 7).
+ * Aligned with Manager's protobuf::create_minimal_user_status_payload
+ */
+function createMinimalUserStatusPayload(email: string): Buffer {
+    return Buffer.concat([
+        writeStringField(3, email),
+        writeStringField(7, email),
+    ]);
+}
+
+/**
+ * Create string value payload for enterprise preferences.
+ * Aligned with Manager's protobuf::create_string_value_payload
+ */
+function createStringValuePayload(value: string): Buffer {
+    return writeStringField(3, value);
 }
 
 /**
@@ -328,14 +451,18 @@ async function writeStateValueByKey(dbPath: string, key: string, value: string):
 /**
  * Write OAuth token info to state.vscdb (unified key)
  * This persists the switched account's token so Antigravity loads it on restart.
+ * Now preserves existing topic entries (e.g. authStateWithContextSentinelKey).
  */
 export async function writeOAuthTokenToStateDb(info: {
     accessToken: string;
     refreshToken: string;
     tokenType?: string;
     expirySeconds: number;
+    idToken?: string;
+    isGcpTos?: boolean;
+    targetIde?: TargetIdeType;
 }): Promise<void> {
-    const dbPath = getAntigravityStateDbPath();
+    const dbPath = info.targetIde ? getStateDbPathForTarget(info.targetIde) : getAntigravityStateDbPath();
     logger.info(`[LocalAuth] Writing OAuth token to state.vscdb: ${dbPath}`);
 
     const tokenInfo: LocalTokenInfo = {
@@ -343,12 +470,157 @@ export async function writeOAuthTokenToStateDb(info: {
         refreshToken: info.refreshToken,
         tokenType: info.tokenType || 'Bearer',
         expirySeconds: info.expirySeconds,
+        idToken: info.idToken,
+        isGcpTos: info.isGcpTos,
     };
 
-    const stateValue = buildUnifiedOAuthState(tokenInfo);
+    // Read existing topic data to preserve other entries (e.g. authStateWithContextSentinelKey)
+    let existingTopicB64: string | undefined;
+    try {
+        existingTopicB64 = await readStateValueByKey(dbPath, UNIFIED_STATE_KEY);
+    } catch {
+        // No existing value — will create fresh topic
+    }
+
+    const stateValue = buildUnifiedOAuthStatePreserving(tokenInfo, existingTopicB64);
     await writeStateValueByKey(dbPath, UNIFIED_STATE_KEY, stateValue);
 
     logger.info('[LocalAuth] OAuth token persisted to state.vscdb successfully');
+}
+
+/**
+ * Write user status to state.vscdb.
+ * Creates antigravityUnifiedStateSync.userStatus with email identity.
+ * Aligned with Manager's inject_user_status.
+ */
+async function writeUserStatus(dbPath: string, email: string): Promise<void> {
+    const payload = createMinimalUserStatusPayload(email);
+    const entryB64 = createUnifiedStateEntry('userStatusSentinelKey', payload);
+    await writeStateValueByKey(dbPath, 'antigravityUnifiedStateSync.userStatus', entryB64);
+    logger.info(`[LocalAuth] User status written for ${email}`);
+}
+
+/**
+ * Write enterprise preferences to state.vscdb.
+ * Aligned with Manager's inject_enterprise_project_preference.
+ */
+async function writeEnterprisePreferences(dbPath: string, projectId: string): Promise<void> {
+    const payload = createStringValuePayload(projectId);
+    const entryB64 = createUnifiedStateEntry('enterpriseGcpProjectId', payload);
+    await writeStateValueByKey(dbPath, 'antigravityUnifiedStateSync.enterprisePreferences', entryB64);
+    logger.info(`[LocalAuth] Enterprise preferences written: ${projectId}`);
+}
+
+/**
+ * Clear enterprise preferences from state.vscdb.
+ * Aligned with Manager's clear_enterprise_project_preference.
+ */
+async function clearEnterprisePreferences(dbPath: string): Promise<void> {
+    try {
+        await deleteStateValueByKey(dbPath, 'antigravityUnifiedStateSync.enterprisePreferences');
+        logger.info('[LocalAuth] Enterprise preferences cleared');
+    } catch {
+        // Ignore if key doesn't exist
+    }
+}
+
+/**
+ * Delete a key from state.vscdb ItemTable.
+ */
+async function deleteStateValueByKey(dbPath: string, key: string): Promise<void> {
+    if (!fs.existsSync(dbPath)) {
+        return;
+    }
+
+    const SQL = await getSqlJs();
+    const fileBuffer = fs.readFileSync(dbPath);
+    let db: Database | null = null;
+
+    try {
+        db = new SQL.Database(fileBuffer);
+        db.run('DELETE FROM ItemTable WHERE key = ?', [key]);
+
+        const data = db.export();
+        const buffer = Buffer.from(data);
+        fs.writeFileSync(dbPath, buffer);
+    } finally {
+        if (db) {
+            db.close();
+        }
+    }
+}
+
+/**
+ * Write full account state to state.vscdb, aligned with Antigravity-Manager's inject_token.
+ * This is the main entry point for account switching — writes all required keys:
+ * 1. oauthToken (with topic entry preservation)
+ * 2. userStatus (email identity for auth chain)
+ * 3. enterprisePreferences (project ID for enterprise accounts)
+ * 4. antigravityOnboarding flag
+ * 5. Delete stale legacy keys
+ */
+export async function writeFullAccountState(params: {
+    accessToken: string;
+    refreshToken: string;
+    tokenType?: string;
+    expirySeconds: number;
+    email: string;
+    idToken?: string;
+    isGcpTos?: boolean;
+    projectId?: string;
+    targetIde?: TargetIdeType;
+}): Promise<void> {
+    const dbPath = params.targetIde ? getStateDbPathForTarget(params.targetIde) : getAntigravityStateDbPath();
+    logger.info(`[LocalAuth] writeFullAccountState: target=${dbPath}, email=${params.email}`);
+
+    // 1. Write oauthToken (preserve existing topic entries)
+    await writeOAuthTokenToStateDb({
+        accessToken: params.accessToken,
+        refreshToken: params.refreshToken,
+        tokenType: params.tokenType,
+        expirySeconds: params.expirySeconds,
+        idToken: params.idToken,
+        isGcpTos: params.isGcpTos,
+        targetIde: params.targetIde,
+    });
+
+    // 2. Write userStatus (email identity for auth chain)
+    try {
+        await writeUserStatus(dbPath, params.email);
+    } catch (error) {
+        const err = error instanceof Error ? error.message : String(error);
+        logger.warn(`[LocalAuth] Failed to write userStatus: ${err}`);
+    }
+
+    // 3. Write/clear enterprisePreferences
+    try {
+        const projectId = params.projectId?.trim();
+        if (projectId) {
+            await writeEnterprisePreferences(dbPath, projectId);
+        } else {
+            await clearEnterprisePreferences(dbPath);
+        }
+    } catch (error) {
+        const err = error instanceof Error ? error.message : String(error);
+        logger.warn(`[LocalAuth] Failed to write enterprisePreferences: ${err}`);
+    }
+
+    // 4. Write onboarding flag
+    try {
+        await writeStateValueByKey(dbPath, 'antigravityOnboarding', 'true');
+    } catch (error) {
+        const err = error instanceof Error ? error.message : String(error);
+        logger.warn(`[LocalAuth] Failed to write onboarding flag: ${err}`);
+    }
+
+    // 5. Delete stale legacy key (prevent IDE from reading stale UserID)
+    try {
+        await deleteStateValueByKey(dbPath, 'jetskiStateSync.agentManagerInitState');
+    } catch {
+        // Non-fatal
+    }
+
+    logger.info(`[LocalAuth] writeFullAccountState completed for ${params.email}`);
 }
 
 async function hasStateValueForKey(dbPath: string, key: string): Promise<boolean> {

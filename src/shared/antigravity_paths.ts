@@ -1,4 +1,5 @@
 import * as childProcess from 'child_process';
+import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
@@ -135,36 +136,89 @@ export function getCockpitToolsSharedDir(): string {
     return path.join(os.homedir(), '.antigravity_cockpit');
 }
 
-export function getAntigravityStateDbPath(): string {
+/**
+ * Target IDE type for state.vscdb path resolution.
+ * - 'classic': Antigravity (classic VS Code fork)
+ * - 'ide': Antigravity IDE (standalone IDE)
+ */
+export type TargetIdeType = 'classic' | 'ide';
+
+/**
+ * Folder name candidates for each target IDE.
+ * Manager uses: classic → ['Antigravity'], ide → ['Antigravity IDE', 'antigravity-ide', 'antigravity_ide']
+ */
+function getFolderNamesForTarget(targetIde: TargetIdeType): string[] {
+    if (targetIde === 'ide') {
+        return ['Antigravity IDE', 'antigravity-ide', 'antigravity_ide'];
+    }
+    return ['Antigravity'];
+}
+
+/**
+ * Get all candidate state.vscdb paths for a target IDE (cross-platform).
+ * Aligned with Antigravity-Manager's db::get_all_candidate_db_paths logic.
+ */
+export function getAllCandidateDbPaths(targetIde: TargetIdeType): string[] {
+    const paths: string[] = [];
+    const folderNames = getFolderNamesForTarget(targetIde);
+
     if (isAntigravityWslRemote()) {
-        return path.posix.join(
-            resolveWslWindowsAppDataDir(),
-            'Antigravity',
-            'User',
-            'globalStorage',
-            'state.vscdb',
-        );
+        try {
+            const appDataDir = resolveWslWindowsAppDataDir();
+            for (const folder of folderNames) {
+                paths.push(path.posix.join(appDataDir, folder, 'User', 'globalStorage', 'state.vscdb'));
+            }
+        } catch {
+            // WSL resolution failed, skip
+        }
+        return paths;
     }
 
     if (overrideUserDataDir) {
-        return path.join(overrideUserDataDir, 'User', 'globalStorage', 'state.vscdb');
+        paths.push(path.join(overrideUserDataDir, 'User', 'globalStorage', 'state.vscdb'));
+        return paths;
     }
 
     const homeDir = os.homedir();
     if (process.platform === 'darwin') {
-        return path.join(
-            homeDir,
-            'Library',
-            'Application Support',
-            'Antigravity',
-            'User',
-            'globalStorage',
-            'state.vscdb',
-        );
-    }
-    if (process.platform === 'win32') {
+        for (const folder of folderNames) {
+            paths.push(path.join(homeDir, 'Library', 'Application Support', folder, 'User', 'globalStorage', 'state.vscdb'));
+        }
+    } else if (process.platform === 'win32') {
         const appData = process.env.APPDATA || path.join(homeDir, 'AppData', 'Roaming');
-        return path.join(appData, 'Antigravity', 'User', 'globalStorage', 'state.vscdb');
+        for (const folder of folderNames) {
+            paths.push(path.join(appData, folder, 'User', 'globalStorage', 'state.vscdb'));
+        }
+    } else {
+        for (const folder of folderNames) {
+            paths.push(path.join(homeDir, '.config', folder, 'User', 'globalStorage', 'state.vscdb'));
+        }
     }
-    return path.join(homeDir, '.config', 'Antigravity', 'User', 'globalStorage', 'state.vscdb');
+
+    return paths;
+}
+
+/**
+ * Resolve the best state.vscdb path for a target IDE.
+ * Tries all candidate paths and returns the first one that exists on disk.
+ * Falls back to the first candidate if none exists.
+ */
+export function getStateDbPathForTarget(targetIde: TargetIdeType): string {
+    const candidates = getAllCandidateDbPaths(targetIde);
+    for (const candidate of candidates) {
+        if (fs.existsSync(candidate)) {
+            return candidate;
+        }
+    }
+    // Fall back to first candidate (may not exist yet)
+    return candidates[0];
+}
+
+/**
+ * Get Antigravity state.vscdb path (default: classic target).
+ * For backward compatibility, this targets Antigravity classic.
+ * Use getStateDbPathForTarget('ide') for Antigravity IDE.
+ */
+export function getAntigravityStateDbPath(): string {
+    return getStateDbPathForTarget('classic');
 }
