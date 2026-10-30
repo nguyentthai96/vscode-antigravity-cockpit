@@ -10,6 +10,7 @@ import { t } from '../shared/i18n';
 import { recordQuotaHistory } from './quota_history';
 import { QuotaRefreshManager } from './quotaRefreshManager';
 import { accountSwitchService } from './accountSwitchService';
+import { detectIdeCurrentEmail } from '../auto_trigger/local_auth_importer';
 
 export interface AccountQuotaCache {
     snapshot: QuotaSnapshot;
@@ -482,9 +483,27 @@ export class AccountsRefreshService {
         const toolsAccounts = toolsResp.accounts ?? [];
         const currentMode = accountSwitchService.getMode();
         const isSeamlessMode = accountSwitchService.isSeamlessMode(currentMode);
-        const activeEmailInPlugin = isSeamlessMode ? await credentialStorage.getActiveAccount() : null;
-        const activeEmailInPluginLower = activeEmailInPlugin?.trim().toLowerCase();
+
+        // Resolve which email is currently active in the IDE.
+        // Primary: credentialStorage marker (set by this extension on every switch).
+        // Fallback: read state.vscdb to detect the current IDE login when the marker is absent
+        //           (e.g. first launch, or user switched accounts outside the extension).
+        let activeEmailInPlugin = isSeamlessMode ? await credentialStorage.getActiveAccount() : null;
         if (isSeamlessMode) {
+            const pluginEmails = toolsAccounts.map((a) => a.email.trim().toLowerCase());
+            const markerInList = activeEmailInPlugin && pluginEmails.includes(activeEmailInPlugin.trim().toLowerCase());
+            if (!markerInList) {
+                // Marker is absent or not in the tools list — fall back to state.vscdb detection
+                const ideEmail = await detectIdeCurrentEmail();
+                if (ideEmail) {
+                    logger.info(
+                        `[AccountsRefresh] Seamless marker absent/stale (marker=${activeEmailInPlugin ?? 'none'}), detected from state.vscdb: ${ideEmail}`,
+                    );
+                    activeEmailInPlugin = ideEmail;
+                    // Persist the detected email so future loads skip the DB read
+                    await credentialStorage.setActiveAccount(ideEmail, false);
+                }
+            }
             logger.info(
                 `[AccountsRefresh] Seamless marker source email=${activeEmailInPlugin ?? 'none'}, toolsAccounts=${toolsAccounts.length}`,
             );
@@ -500,7 +519,7 @@ export class AccountsRefreshService {
         for (const acc of toolsAccounts) {
             const isCurrentByTools = acc.is_current || (toolsResp.current_account_id ? acc.id === toolsResp.current_account_id : false);
             const isCurrentBySeamless = Boolean(
-                activeEmailInPluginLower && acc.email.trim().toLowerCase() === activeEmailInPluginLower,
+                activeEmailInPlugin && acc.email.trim().toLowerCase() === activeEmailInPlugin.trim().toLowerCase(),
             );
             const isCurrent = isSeamlessMode ? isCurrentBySeamless : isCurrentByTools;
             if (isCurrent) {

@@ -373,32 +373,59 @@ function removeUnifiedTopicEntry(data: Buffer, targetKey: string): Buffer {
 /**
  * Build unified OAuth state value with topic entry preservation.
  * Reads existing topic data, removes old oauthTokenInfoSentinelKey entry, adds new one.
- * This preserves authStateWithContextSentinelKey and other IDE-managed entries.
+ * Also updates authStateWithContextSentinelKey so IDE Settings shows the correct account.
  * Aligned with Manager's inject_new_format logic.
  */
-function buildUnifiedOAuthStatePreserving(info: LocalTokenInfo, existingTopicB64?: string): string {
+function buildUnifiedOAuthStatePreserving(info: LocalTokenInfo, existingTopicB64?: string, authContext?: { email: string; projectId?: string; isGcpTos?: boolean }): string {
     // 1. Build OAuthTokenInfo protobuf
     const oauthInfoProto = buildOAuthTokenInfoProto(info);
 
     // 2. Build new topic entry for oauthTokenInfoSentinelKey
-    const newEntry = createUnifiedTopicEntry('oauthTokenInfoSentinelKey', oauthInfoProto);
+    const newOAuthEntry = createUnifiedTopicEntry('oauthTokenInfoSentinelKey', oauthInfoProto);
 
-    // 3. If existing topic data exists, remove old entry and merge
+    // 3. If existing topic data exists, remove stale entries and merge
     let topicData: Buffer;
     if (existingTopicB64) {
         try {
             const existingTopic = Buffer.from(existingTopicB64, 'base64');
-            const cleaned = removeUnifiedTopicEntry(existingTopic, 'oauthTokenInfoSentinelKey');
-            topicData = Buffer.concat([cleaned, newEntry]);
+            let cleaned = removeUnifiedTopicEntry(existingTopic, 'oauthTokenInfoSentinelKey');
+            // Also replace authStateWithContext so IDE Settings panel shows correct account
+            if (authContext) {
+                cleaned = removeUnifiedTopicEntry(cleaned, 'authStateWithContextSentinelKey');
+            }
+            topicData = Buffer.concat([cleaned, newOAuthEntry]);
         } catch {
-            // If parsing fails, create fresh topic with just this entry
-            topicData = newEntry;
+            topicData = newOAuthEntry;
         }
     } else {
-        topicData = newEntry;
+        topicData = newOAuthEntry;
     }
 
-    // 4. Base64 encode the full topic
+    // 4. Inject updated authStateWithContextSentinelKey (plain JSON string, not protobuf)
+    // Format from IDE source (vfa() function): {"state":"signedIn","context":{...}}
+    if (authContext) {
+        const authStateJson = JSON.stringify({
+            state: 'signedIn',
+            context: {
+                project: authContext.projectId ?? '',
+                showProjectError: false,
+                errorMessage: '',
+                ineligibleMessage: '',
+                verificationUrl: '',
+                isGcpTos: authContext.isGcpTos ?? false,
+                browserOpenFailed: false,
+                appealUrl: '',
+                appealLinkText: '',
+                email: authContext.email,
+            },
+        });
+        // The authStateWithContextSentinelKey payload is stored as plain string (not protobuf-encoded bytes)
+        const authStatePayload = Buffer.from(authStateJson, 'utf8');
+        const authStateEntry = createUnifiedTopicEntry('authStateWithContextSentinelKey', authStatePayload);
+        topicData = Buffer.concat([topicData, authStateEntry]);
+    }
+
+    // 5. Base64 encode the full topic
     return topicData.toString('base64');
 }
 
@@ -461,6 +488,8 @@ export async function writeOAuthTokenToStateDb(info: {
     idToken?: string;
     isGcpTos?: boolean;
     targetIde?: TargetIdeType;
+    email?: string;
+    projectId?: string;
 }): Promise<void> {
     const dbPath = info.targetIde ? getStateDbPathForTarget(info.targetIde) : getAntigravityStateDbPath();
     logger.info(`[LocalAuth] Writing OAuth token to state.vscdb: ${dbPath}`);
@@ -474,7 +503,7 @@ export async function writeOAuthTokenToStateDb(info: {
         isGcpTos: info.isGcpTos,
     };
 
-    // Read existing topic data to preserve other entries (e.g. authStateWithContextSentinelKey)
+    // Read existing topic data to preserve other entries
     let existingTopicB64: string | undefined;
     try {
         existingTopicB64 = await readStateValueByKey(dbPath, UNIFIED_STATE_KEY);
@@ -482,7 +511,11 @@ export async function writeOAuthTokenToStateDb(info: {
         // No existing value — will create fresh topic
     }
 
-    const stateValue = buildUnifiedOAuthStatePreserving(tokenInfo, existingTopicB64);
+    const authContext = info.email
+        ? { email: info.email, projectId: info.projectId, isGcpTos: info.isGcpTos }
+        : undefined;
+
+    const stateValue = buildUnifiedOAuthStatePreserving(tokenInfo, existingTopicB64, authContext);
     await writeStateValueByKey(dbPath, UNIFIED_STATE_KEY, stateValue);
 
     logger.info('[LocalAuth] OAuth token persisted to state.vscdb successfully');
@@ -573,7 +606,7 @@ export async function writeFullAccountState(params: {
     const dbPath = params.targetIde ? getStateDbPathForTarget(params.targetIde) : getAntigravityStateDbPath();
     logger.info(`[LocalAuth] writeFullAccountState: target=${dbPath}, email=${params.email}`);
 
-    // 1. Write oauthToken (preserve existing topic entries)
+    // 1. Write oauthToken (preserve existing topic entries, update authStateWithContext)
     await writeOAuthTokenToStateDb({
         accessToken: params.accessToken,
         refreshToken: params.refreshToken,
@@ -582,6 +615,8 @@ export async function writeFullAccountState(params: {
         idToken: params.idToken,
         isGcpTos: params.isGcpTos,
         targetIde: params.targetIde,
+        email: params.email,
+        projectId: params.projectId,
     });
 
     // 2. Write userStatus (email identity for auth chain)
@@ -807,6 +842,57 @@ export async function ensureLocalCredentialImported(
     } catch (error) {
         const err = error instanceof Error ? error : new Error(String(error));
         logger.debug(`[LocalAuth] Failed to import local credential: ${err.message}`);
+        return null;
+    }
+}
+
+/**
+ * Detect the email currently logged in to Antigravity IDE by reading state.vscdb.
+ * Reads the refresh_token from the IDE's state.vscdb, then matches it against
+ * credentials stored in credentialStorage. This is the equivalent of
+ * Antigravity-Manager's detect_active_clients_status() logic.
+ *
+ * Returns the matched email, or null if not found / state.vscdb unreadable.
+ */
+export async function detectIdeCurrentEmail(): Promise<string | null> {
+    try {
+        const dbPath = getStateDbPathForTarget('ide');
+        if (!fs.existsSync(dbPath)) {
+            logger.debug('[LocalAuth] detectIdeCurrentEmail: state.vscdb not found at', dbPath);
+            return null;
+        }
+
+        let tokenInfo: LocalTokenInfo;
+        try {
+            tokenInfo = await readUnifiedTokenInfo(dbPath);
+        } catch {
+            // Fall back to legacy key
+            try {
+                tokenInfo = await readLegacyTokenInfo(dbPath);
+            } catch {
+                logger.debug('[LocalAuth] detectIdeCurrentEmail: no readable token in state.vscdb');
+                return null;
+            }
+        }
+
+        if (!tokenInfo.refreshToken) {
+            return null;
+        }
+
+        const credentials = await credentialStorage.getAllCredentials();
+        const ideRefreshToken = tokenInfo.refreshToken.trim();
+        for (const [email, cred] of Object.entries(credentials)) {
+            if (cred.refreshToken && cred.refreshToken.trim() === ideRefreshToken) {
+                logger.info(`[LocalAuth] detectIdeCurrentEmail: matched ${email} via refresh_token`);
+                return email;
+            }
+        }
+
+        logger.debug('[LocalAuth] detectIdeCurrentEmail: refresh_token not matched to any stored account');
+        return null;
+    } catch (error) {
+        const err = error instanceof Error ? error.message : String(error);
+        logger.debug(`[LocalAuth] detectIdeCurrentEmail failed: ${err}`);
         return null;
     }
 }
