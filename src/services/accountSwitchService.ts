@@ -294,11 +294,11 @@ class AccountSwitchService {
                 }
             }
 
-            // Persist full account state to state.vscdb so Antigravity loads this account on restart
+            // Persist full account state to ALL target IDEs (IDE + Classic)
             // Writes: oauthToken (preserving authState), userStatus, enterprisePreferences, onboarding
             try {
-                const { writeFullAccountState } = await import('../auto_trigger/local_auth_importer');
-                await writeFullAccountState({
+                const { writeFullAccountStateToAllTargets } = await import('../auto_trigger/local_auth_importer');
+                const writeResult = await writeFullAccountStateToAllTargets({
                     accessToken,
                     refreshToken: credential.refreshToken,
                     tokenType: 'Bearer',
@@ -306,13 +306,42 @@ class AccountSwitchService {
                     email: resolvedEmail,
                     isGcpTos: false,
                     projectId: credential.projectId,
-                    targetIde: 'ide',
                 });
-                logger.info(`[AccountSwitchService] Persisted full account state to state.vscdb for ${resolvedEmail}`);
+                logger.info(
+                    `[AccountSwitchService] Multi-target persist: ${writeResult.successCount}/${writeResult.totalTargets} targets OK for ${resolvedEmail}`,
+                );
+                if (writeResult.failedTargets.length > 0) {
+                    logger.warn(
+                        `[AccountSwitchService] Failed targets: ${writeResult.failedTargets.map(f => f.target).join(', ')}`,
+                    );
+                }
             } catch (persistError) {
                 const err = persistError instanceof Error ? persistError.message : String(persistError);
                 logger.warn(`[AccountSwitchService] Failed to persist to state.vscdb: ${err}`);
                 // Non-fatal: seamless switch still works for current session
+            }
+
+            // Update macOS Keychain so IDE Language Server picks up the new account.
+            // The Language Server stores auth in Keychain (service=gemini, account=antigravity)
+            // and IDE Settings reads id_token_email from it. Without this, IDE Settings
+            // would continue showing the old account even after switch.
+            try {
+                const { updateKeychainForAccountSwitch } = await import('../auto_trigger/keychain_service');
+                const keychainOk = await updateKeychainForAccountSwitch({
+                    accessToken,
+                    refreshToken: credential.refreshToken,
+                    email: resolvedEmail,
+                    expirySeconds: Math.floor(expiryMs / 1000),
+                });
+                if (keychainOk) {
+                    logger.info(
+                        `[AccountSwitchService] Keychain updated for ${resolvedEmail}`,
+                    );
+                }
+            } catch (keychainError) {
+                const err = keychainError instanceof Error ? keychainError.message : String(keychainError);
+                logger.warn(`[AccountSwitchService] Keychain update failed (non-fatal): ${err}`);
+                // Non-fatal: macOS Keychain is a bonus layer for IDE Settings sync
             }
 
             await credentialStorage.setActiveAccount(resolvedEmail, true);

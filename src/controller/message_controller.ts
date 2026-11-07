@@ -1082,19 +1082,18 @@ export class MessageController {
                             logger.info(
                                 `[MsgCtrl] switchAccount completed with marker update: target=${email}, current=${switchedEmail}, mode=${execution.effectiveMode}`,
                             );
-                            // Seamless mode: prompt user to reload so IDE account icon updates
+                            // Seamless mode: auto-reload window so IDE Settings and account icon update.
+                            // Token is already active in runtime via setOAuthTokenInfo —
+                            // reload is only needed for the IDE UI layer to re-read Keychain & state.vscdb.
                             if (accountSwitchService.isSeamlessMode(execution.effectiveMode)) {
-                                logger.info('[MsgCtrl] Seamless switch done, prompting user to reload window');
-                                const reloadAction = 'Reload Now';
-                                const laterAction = 'Later';
-                                const choice = await vscode.window.showInformationMessage(
-                                    `Account switched to ${switchedEmail}. Reload window to update the account icon?`,
-                                    reloadAction,
-                                    laterAction,
+                                logger.info('[MsgCtrl] Seamless switch done, auto-reloading window for UI sync');
+                                vscode.window.showInformationMessage(
+                                    `Account switched to ${switchedEmail}. Reloading window...`,
                                 );
-                                if (choice === reloadAction) {
+                                // Brief delay to let Keychain write settle and message display
+                                setTimeout(() => {
                                     vscode.commands.executeCommand('workbench.action.reloadWindow');
-                                }
+                                }, 800);
                             }
                         } else if (execution.errorCode === 'tools_offline' && execution.effectiveMode === 'default') {
                             this.hud.sendMessage({
