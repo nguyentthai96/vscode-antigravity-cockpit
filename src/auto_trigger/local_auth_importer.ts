@@ -7,7 +7,7 @@ import { credentialStorage } from './credential_storage';
 import { oauthService } from './oauth_service';
 import { OAuthCredential } from './types';
 import { logger } from '../shared/log_service';
-import { getAntigravityStateDbPath, getAntigravityUserDataDir, getStateDbPathForTarget, TargetIdeType } from '../shared/antigravity_paths';
+import { getAntigravityStateDbPath, getAntigravityUserDataDir, getStateDbPathForTarget, getAllWritableDbPaths, TargetIdeType } from '../shared/antigravity_paths';
 
 const LEGACY_STATE_KEY = 'jetskiStateSync.agentManagerInitState';
 const UNIFIED_STATE_KEY = 'antigravityUnifiedStateSync.oauthToken';
@@ -584,6 +584,76 @@ async function deleteStateValueByKey(dbPath: string, key: string): Promise<void>
 }
 
 /**
+ * Update `lastLoginUsername` in the `google.google-antigravity` JSON blob.
+ *
+ * The IDE native extension (`google.google-antigravity`) stores onboarding
+ * state as a JSON object in state.vscdb under key `google.google-antigravity`.
+ * Inside it, `antigravity-storage.agy.onboarding.lastLoginUsername` controls
+ * which email the IDE UI displays. This function performs a read-modify-write
+ * to update that field so the IDE shows the switched account correctly.
+ *
+ * Storage key mapping (IDE uses `jetski.` prefix internally, stores as `agy.`):
+ *   jetski.onboarding.lastLoginUsername → agy.onboarding.lastLoginUsername
+ *   jetski.onboarding.lastLoginIsGcpTos → agy.onboarding.lastLoginIsGcpTos
+ */
+async function updateLastLoginUsernameInJson(
+    dbPath: string,
+    email: string,
+    isGcpTos?: boolean,
+): Promise<void> {
+    if (!fs.existsSync(dbPath)) {
+        return;
+    }
+
+    const STORAGE_KEY = 'google.google-antigravity';
+    const SQL = await getSqlJs();
+    const fileBuffer = fs.readFileSync(dbPath);
+    let db: Database | null = null;
+
+    try {
+        db = new SQL.Database(fileBuffer);
+        const stmt = db.prepare('SELECT value FROM ItemTable WHERE key = ?');
+        stmt.bind([STORAGE_KEY]);
+
+        let jsonObj: Record<string, unknown> = {};
+        if (stmt.step()) {
+            const row = stmt.get();
+            if (row && row[0]) {
+                try {
+                    jsonObj = JSON.parse(String(row[0]));
+                } catch {
+                    // Corrupted JSON — create fresh
+                    jsonObj = {};
+                }
+            }
+        }
+        stmt.free();
+
+        // Ensure antigravity-storage sub-object exists
+        if (!jsonObj['antigravity-storage'] || typeof jsonObj['antigravity-storage'] !== 'object') {
+            jsonObj['antigravity-storage'] = {};
+        }
+
+        const storage = jsonObj['antigravity-storage'] as Record<string, string>;
+        storage['agy.onboarding.lastLoginUsername'] = email;
+        storage['agy.onboarding.lastLoginIsGcpTos'] = String(isGcpTos ?? false);
+
+        const newValue = JSON.stringify(jsonObj);
+        db.run('INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)', [STORAGE_KEY, newValue]);
+
+        const data = db.export();
+        const buffer = Buffer.from(data);
+        fs.writeFileSync(dbPath, buffer);
+
+        logger.info(`[LocalAuth] Updated lastLoginUsername to ${email} in ${STORAGE_KEY}`);
+    } finally {
+        if (db) {
+            db.close();
+        }
+    }
+}
+
+/**
  * Write full account state to state.vscdb, aligned with Antigravity-Manager's inject_token.
  * This is the main entry point for account switching — writes all required keys:
  * 1. oauthToken (with topic entry preservation)
@@ -655,7 +725,99 @@ export async function writeFullAccountState(params: {
         // Non-fatal
     }
 
+    // 6. Update lastLoginUsername in google.google-antigravity JSON storage.
+    // The IDE native onboarding flow stores the logged-in email under
+    // `agy.onboarding.lastLoginUsername` inside the `google.google-antigravity`
+    // JSON blob in state.vscdb. When the IDE restarts, it reads this value to
+    // display in the UI. If we don't update it here, the IDE continues showing
+    // the old account even though oauthToken/userStatus are already switched.
+    try {
+        await updateLastLoginUsernameInJson(dbPath, params.email, params.isGcpTos);
+    } catch (error) {
+        const err = error instanceof Error ? error.message : String(error);
+        logger.warn(`[LocalAuth] Failed to update lastLoginUsername JSON: ${err}`);
+        // Non-fatal: auth tokens are already written correctly
+    }
+
     logger.info(`[LocalAuth] writeFullAccountState completed for ${params.email}`);
+}
+
+/**
+ * Parameters for multi-target account state write.
+ * Same as writeFullAccountState params but WITHOUT targetIde
+ * (targets are resolved automatically via getAllWritableDbPaths).
+ */
+export interface WriteAccountStateParams {
+    accessToken: string;
+    refreshToken: string;
+    tokenType?: string;
+    expirySeconds: number;
+    email: string;
+    idToken?: string;
+    isGcpTos?: boolean;
+    projectId?: string;
+}
+
+/**
+ * Result of multi-target write operation.
+ */
+export interface MultiTargetWriteResult {
+    totalTargets: number;
+    successCount: number;
+    failedTargets: Array<{ target: string; error: string }>;
+}
+
+/**
+ * Write full account state to ALL available target IDEs.
+ * Scans disk for existing state.vscdb paths (IDE + Classic),
+ * then writes account state to each one.
+ *
+ * Uses partial-success model:
+ * - Some targets fail → continues, logs warnings
+ * - ALL targets fail → throws error
+ * - No targets found → returns with totalTargets: 0
+ *
+ * Aligned with Antigravity-Manager db.rs inject_token_to_path pattern,
+ * but extended to write to MULTIPLE targets simultaneously.
+ */
+export async function writeFullAccountStateToAllTargets(
+    params: WriteAccountStateParams,
+): Promise<MultiTargetWriteResult> {
+    const targets = getAllWritableDbPaths();
+    const result: MultiTargetWriteResult = {
+        totalTargets: targets.length,
+        successCount: 0,
+        failedTargets: [],
+    };
+
+    if (targets.length === 0) {
+        logger.warn('[LocalAuth] writeFullAccountStateToAllTargets: no writable targets found');
+        return result;
+    }
+
+    logger.info(`[LocalAuth] writeFullAccountStateToAllTargets: ${targets.length} targets for ${params.email}`);
+
+    for (const { target, path } of targets) {
+        try {
+            await writeFullAccountState({
+                ...params,
+                targetIde: target,
+            });
+            result.successCount++;
+            logger.info(`[LocalAuth] Multi-target write OK: ${target} → ${path}`);
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            result.failedTargets.push({ target, error: message });
+            logger.warn(`[LocalAuth] Multi-target write FAILED: ${target} → ${message}`);
+        }
+    }
+
+    if (result.successCount === 0 && result.totalTargets > 0) {
+        const errors = result.failedTargets.map(f => `${f.target}: ${f.error}`).join('; ');
+        throw new Error(`All targets failed: ${errors}`);
+    }
+
+    return result;
 }
 
 async function hasStateValueForKey(dbPath: string, key: string): Promise<boolean> {

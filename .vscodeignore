@@ -1,8 +1,11 @@
 # Exclude development environments
 .vscode/**
 .vscode-test/**
+.idea/**
+.github/**
 .claude/**
 scripts/**
+release/**
 tmp/**
 
 # Exclude source code and maps

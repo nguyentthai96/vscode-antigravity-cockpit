@@ -222,3 +222,36 @@ export function getStateDbPathForTarget(targetIde: TargetIdeType): string {
 export function getAntigravityStateDbPath(): string {
     return getStateDbPathForTarget('classic');
 }
+
+/**
+ * Represents a writable state.vscdb target found on disk.
+ */
+export interface WritableDbTarget {
+    target: TargetIdeType;
+    path: string;
+}
+
+/**
+ * Get ALL writable state.vscdb paths across all target IDE types.
+ * For each target type (ide, classic), returns the first existing candidate path.
+ * Used by multi-target account switching to sync state across all installations.
+ *
+ * Returns only paths that exist on disk — will not create new state.vscdb files.
+ * Aligned with Antigravity-Manager db.rs inject pattern (extended to multi-target).
+ */
+export function getAllWritableDbPaths(): WritableDbTarget[] {
+    const results: WritableDbTarget[] = [];
+    const targets: TargetIdeType[] = ['ide', 'classic'];
+
+    for (const target of targets) {
+        const candidates = getAllCandidateDbPaths(target);
+        for (const candidate of candidates) {
+            if (fs.existsSync(candidate)) {
+                results.push({ target, path: candidate });
+                break;
+            }
+        }
+    }
+
+    return results;
+}
