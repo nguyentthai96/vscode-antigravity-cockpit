@@ -4,6 +4,8 @@
 .idea/**
 .github/**
 .claude/**
+.agents/**
+.gitnexus/**
 scripts/**
 release/**
 tmp/**
@@ -25,10 +27,12 @@ tsconfig.json
 package-lock.json
 jest.config.js
 .env.local
+AGENTS.md
 
 # Exclude docs directory and full announcement source
 docs/**
 announcements_full.json
+announcements_dev.json
 
 # Exclude specific assets (KEEP icon.png)
 assets/*

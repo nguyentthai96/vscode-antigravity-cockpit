@@ -1,25 +1,29 @@
 /**
- * macOS Keychain integration for Antigravity IDE Language Server auth.
+ * OS Keyring integration for Antigravity IDE Language Server auth.
  *
- * The IDE Language Server (Go binary) stores its OAuth token in macOS Keychain
- * under service="gemini", account="antigravity" as a go-keyring-base64 encoded
- * JSON blob. This module updates that entry so the Language Server picks up
- * the switched account on its next token read.
+ * The IDE Language Server (Go binary) stores its OAuth token in the OS keyring
+ * under service="gemini", account="antigravity" as a JSON blob.
+ *
+ * Platform support:
+ * - macOS: Keychain via `/usr/bin/security` (go-keyring-base64 prefix)
+ * - Linux: D-Bus Secret Service (gnome-keyring) via python3 (raw JSON)
+ * - Windows: Not yet supported (no-op)
  *
  * Keychain payload format:
  * ```
- * go-keyring-base64:<base64({
+ * {
  *   "token": { access_token, token_type, refresh_token, expiry, expires_in },
  *   "auth_method": "consumer",
  *   "id_token_email": "<email>",
  *   "writer_id": "<unique id>"
- * })>
+ * }
  * ```
  *
- * Only supported on macOS. On other platforms, this module is a no-op.
+ * macOS stores as: go-keyring-base64:<base64(JSON)>
+ * Linux stores as: raw JSON
  */
 
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 import { logger } from '../shared/log_service';
 
@@ -45,22 +49,29 @@ export interface KeychainTokenPayload {
     writer_id: string;
 }
 
-/**
- * Check if running on macOS (only platform with Keychain support).
- */
 function isMacOS(): boolean {
     return process.platform === 'darwin';
 }
 
+function isLinux(): boolean {
+    return process.platform === 'linux';
+}
+
 /**
  * Read current Keychain token.
- * Returns null if entry doesn't exist or on non-macOS platforms.
+ * Returns null if entry doesn't exist or on unsupported platforms.
  */
 export async function readKeychainToken(): Promise<KeychainTokenPayload | null> {
-    if (!isMacOS()) {
-        return null;
+    if (isMacOS()) {
+        return readKeychainTokenMacOS();
     }
+    if (isLinux()) {
+        return readKeychainTokenLinux();
+    }
+    return null;
+}
 
+async function readKeychainTokenMacOS(): Promise<KeychainTokenPayload | null> {
     try {
         const { stdout } = await execFileAsync(SECURITY_CMD, [
             'find-generic-password',
@@ -80,32 +91,65 @@ export async function readKeychainToken(): Promise<KeychainTokenPayload | null> 
         return JSON.parse(json) as KeychainTokenPayload;
     } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
-        // Item not found is expected for first-time setup
         if (msg.includes('could not be found') || msg.includes('SecKeychainSearchCopyNext')) {
             logger.info('[Keychain] No existing gemini keychain entry');
         } else {
-            logger.warn(`[Keychain] Failed to read: ${msg}`);
+            logger.warn('[Keychain] Failed to read: ' + msg);
         }
         return null;
     }
 }
 
 /**
- * Write token to macOS Keychain (service=gemini, account=antigravity).
- * Uses `security add-generic-password -U` to update or create.
- *
- * This is a no-op on non-macOS platforms.
+ * Read token from Linux D-Bus Secret Service (gnome-keyring).
+ * go_keyring on Linux stores raw JSON (no base64 prefix).
+ */
+async function readKeychainTokenLinux(): Promise<KeychainTokenPayload | null> {
+    try {
+        const script = `
+import dbus, json, sys
+bus = dbus.SessionBus()
+svc = dbus.Interface(bus.get_object('org.freedesktop.secrets', '/org/freedesktop/secrets'), 'org.freedesktop.Secret.Service')
+items, _ = svc.SearchItems({'service': '${KEYCHAIN_SERVICE}', 'username': '${KEYCHAIN_ACCOUNT}'})
+if not items:
+    sys.exit(1)
+_, session = svc.OpenSession('plain', dbus.String(''))
+item = bus.get_object('org.freedesktop.secrets', items[0])
+secret = dbus.Interface(item, 'org.freedesktop.Secret.Item').GetSecret(session)
+print(bytes(secret[2]).decode('utf-8'))
+`;
+        const { stdout } = await execFileAsync('python3', ['-c', script], { timeout: 5000 });
+        const raw = stdout.trim();
+        if (!raw) {
+            return null;
+        }
+        return JSON.parse(raw) as KeychainTokenPayload;
+    } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        logger.info('[Keychain] Linux secret read: ' + msg);
+        return null;
+    }
+}
+
+/**
+ * Write token to OS Keyring.
  */
 export async function writeKeychainToken(payload: KeychainTokenPayload): Promise<boolean> {
-    if (!isMacOS()) {
-        logger.info('[Keychain] Skipping: not macOS');
-        return false;
+    if (isMacOS()) {
+        return writeKeychainTokenMacOS(payload);
     }
+    if (isLinux()) {
+        return writeKeychainTokenLinux(payload);
+    }
+    logger.info('[Keychain] Skipping: unsupported platform ' + process.platform);
+    return false;
+}
 
+async function writeKeychainTokenMacOS(payload: KeychainTokenPayload): Promise<boolean> {
     try {
         const json = JSON.stringify(payload);
         const b64 = Buffer.from(json).toString('base64');
-        const keychainValue = `go-keyring-base64:${b64}`;
+        const keychainValue = 'go-keyring-base64:' + b64;
 
         // Delete existing entry first (ignore errors if not exists)
         try {
@@ -127,11 +171,109 @@ export async function writeKeychainToken(payload: KeychainTokenPayload): Promise
             '-U', // Update if exists
         ]);
 
-        logger.info(`[Keychain] Token written for ${payload.id_token_email}`);
+        logger.info('[Keychain] macOS token written for ' + payload.id_token_email);
         return true;
     } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
-        logger.error(`[Keychain] Failed to write: ${msg}`);
+        logger.error('[Keychain] macOS write failed: ' + msg);
+        return false;
+    }
+}
+
+/**
+ * Write token to Linux D-Bus Secret Service (gnome-keyring).
+ * go_keyring on Linux stores raw JSON with attributes:
+ *   service=gemini, username=antigravity, xdg:schema=org.freedesktop.Secret.Generic
+ */
+async function writeKeychainTokenLinux(payload: KeychainTokenPayload): Promise<boolean> {
+    try {
+        const jsonStr = JSON.stringify(payload);
+        // Use python3 + dbus to write to gnome-keyring
+        // This matches the exact format go_keyring uses on Linux
+        const script = `
+import dbus, sys
+
+bus = dbus.SessionBus()
+svc_obj = bus.get_object('org.freedesktop.secrets', '/org/freedesktop/secrets')
+svc = dbus.Interface(svc_obj, 'org.freedesktop.Secret.Service')
+
+# Open a plain-text session
+_, session = svc.OpenSession('plain', dbus.String(''))
+
+# Delete existing item if present
+items, _ = svc.SearchItems({'service': '${KEYCHAIN_SERVICE}', 'username': '${KEYCHAIN_ACCOUNT}'})
+for item_path in items:
+    item = bus.get_object('org.freedesktop.secrets', item_path)
+    dbus.Interface(item, 'org.freedesktop.Secret.Item').Delete()
+
+# Create new item in the default collection
+collection = bus.get_object('org.freedesktop.secrets', '/org/freedesktop/secrets/aliases/default')
+coll_iface = dbus.Interface(collection, 'org.freedesktop.Secret.Collection')
+
+secret_value = dbus.Struct(
+    (
+        dbus.ObjectPath(session),
+        dbus.ByteArray(b''),
+        dbus.ByteArray(sys.stdin.buffer.read()),
+        dbus.String('text/plain'),
+    ),
+    signature='oayays',
+)
+
+properties = {
+    'org.freedesktop.Secret.Item.Label': "Password for '${KEYCHAIN_ACCOUNT}' on '${KEYCHAIN_SERVICE}'",
+    'org.freedesktop.Secret.Item.Attributes': dbus.Dictionary({
+        'service': '${KEYCHAIN_SERVICE}',
+        'username': '${KEYCHAIN_ACCOUNT}',
+        'xdg:schema': 'org.freedesktop.Secret.Generic',
+    }, signature='ss'),
+}
+
+item_path, prompt_path = coll_iface.CreateItem(properties, secret_value, True)
+if str(prompt_path) != '/':
+    prompt = dbus.Interface(bus.get_object('org.freedesktop.secrets', prompt_path), 'org.freedesktop.Secret.Prompt')
+    prompt.Perform('')
+
+print('OK')
+`;
+        // Use spawn to pipe JSON payload via stdin (execFile can't do stdin)
+        const result = await new Promise<boolean>((resolve) => {
+            const proc = spawn('python3', ['-c', script], {
+                stdio: ['pipe', 'pipe', 'pipe'],
+                timeout: 5000,
+            });
+
+            let stdoutData = '';
+            let stderrData = '';
+
+            proc.stdout.on('data', (data: Buffer) => { stdoutData += data.toString(); });
+            proc.stderr.on('data', (data: Buffer) => { stderrData += data.toString(); });
+
+            proc.on('close', (code: number) => {
+                if (code === 0 && stdoutData.trim().includes('OK')) {
+                    resolve(true);
+                } else {
+                    logger.warn('[Keychain] Linux write process exited ' + code + ': ' + stderrData);
+                    resolve(false);
+                }
+            });
+
+            proc.on('error', (err: Error) => {
+                logger.warn('[Keychain] Linux write spawn error: ' + err.message);
+                resolve(false);
+            });
+
+            proc.stdin.write(jsonStr);
+            proc.stdin.end();
+        });
+
+        if (result) {
+            logger.info('[Keychain] Linux token written for ' + payload.id_token_email);
+        }
+        return result;
+    } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        logger.error('[Keychain] Linux write failed: ' + msg);
         return false;
     }
 }
@@ -153,7 +295,7 @@ export function buildKeychainPayload(params: {
     const sign = tzOffset >= 0 ? '+' : '-';
     const hours = String(Math.floor(Math.abs(tzOffset) / 60)).padStart(2, '0');
     const minutes = String(Math.abs(tzOffset) % 60).padStart(2, '0');
-    const expiry = expiryDate.toISOString().replace('Z', `${sign}${hours}:${minutes}`);
+    const expiry = expiryDate.toISOString().replace('Z', sign + hours + ':' + minutes);
 
     return {
         token: {
@@ -165,15 +307,16 @@ export function buildKeychainPayload(params: {
         },
         auth_method: 'consumer',
         id_token_email: params.email,
-        writer_id: `cockpit_switch_${Date.now()}`,
+        writer_id: 'cockpit_switch_' + Date.now(),
     };
 }
 
 /**
- * High-level: Update Keychain for account switch.
+ * High-level: Update OS Keyring for account switch.
  * Called from AccountSwitchService after writeFullAccountStateToAllTargets.
  *
- * @returns true if Keychain was updated, false otherwise (non-macOS or error)
+ * Supported platforms: macOS (Keychain), Linux (D-Bus Secret Service / gnome-keyring)
+ * @returns true if keyring was updated, false otherwise
  */
 export async function updateKeychainForAccountSwitch(params: {
     accessToken: string;
@@ -181,7 +324,7 @@ export async function updateKeychainForAccountSwitch(params: {
     email: string;
     expirySeconds: number;
 }): Promise<boolean> {
-    if (!isMacOS()) {
+    if (!isMacOS() && !isLinux()) {
         return false;
     }
 
@@ -190,14 +333,16 @@ export async function updateKeychainForAccountSwitch(params: {
         const success = await writeKeychainToken(payload);
 
         if (success) {
-            logger.info(`[Keychain] Account switch: Keychain updated to ${params.email}`);
+            logger.info('[Keychain] Account switch: keyring updated to ' + params.email +
+                ' (platform=' + process.platform + ')');
         }
 
         return success;
     } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
-        logger.warn(`[Keychain] Account switch Keychain update failed (non-fatal): ${msg}`);
-        // Non-fatal: state.vscdb is already updated, Keychain is bonus
+        logger.warn('[Keychain] Account switch keyring update failed (non-fatal): ' + msg);
+        // Non-fatal: state.vscdb is already updated, keyring is bonus
         return false;
     }
 }
+

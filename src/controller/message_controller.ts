@@ -40,6 +40,8 @@ export interface AccountSwitchExecutionResult {
     errorCode: string | null;
     errorMessage: string | null;
     finishedAt: string;
+    /** Whether the OS keyring was updated. If false, window reload would lose the runtime token. */
+    keychainUpdated?: boolean;
 }
 
 export class MessageController {
@@ -203,6 +205,7 @@ export class MessageController {
             errorCode,
             errorMessage,
             finishedAt,
+            keychainUpdated: result.keychainUpdated,
         };
     }
 
@@ -1086,14 +1089,30 @@ export class MessageController {
                             // Token is already active in runtime via setOAuthTokenInfo —
                             // reload is only needed for the IDE UI layer to re-read Keychain & state.vscdb.
                             if (accountSwitchService.isSeamlessMode(execution.effectiveMode)) {
-                                logger.info('[MsgCtrl] Seamless switch done, auto-reloading window for UI sync');
-                                vscode.window.showInformationMessage(
-                                    `Account switched to ${switchedEmail}. Reloading window...`,
-                                );
-                                // Brief delay to let Keychain write settle and message display
-                                setTimeout(() => {
-                                    vscode.commands.executeCommand('workbench.action.reloadWindow');
-                                }, 800);
+                                if (execution.keychainUpdated) {
+                                    // Keychain updated → safe to reload (LS will pick up new token from OS keyring)
+                                    logger.info('[MsgCtrl] Seamless switch done, keychain updated — auto-reloading window for UI sync');
+                                    vscode.window.showInformationMessage(
+                                        'Account switched to ' + switchedEmail + '. Reloading window...',
+                                    );
+                                    // Brief delay to let Keychain write settle and message display
+                                    setTimeout(() => {
+                                        vscode.commands.executeCommand('workbench.action.reloadWindow');
+                                    }, 800);
+                                } else {
+                                    // Keychain NOT updated (Windows) → DO NOT reload.
+                                    // Runtime token (via setOAuthTokenInfo) is already active for AI requests.
+                                    // Reloading would restart the Language Server, which would read the OLD
+                                    // token from OS keyring and lose the switched account.
+                                    logger.info(
+                                        '[MsgCtrl] Seamless switch done, keychain NOT updated (platform=' + process.platform + '). ' +
+                                        'Skipping window reload to preserve runtime token.',
+                                    );
+                                    vscode.window.showInformationMessage(
+                                        'Account switched to ' + switchedEmail + '. AI tools are using the new account. ' +
+                                        'IDE Settings will update on next restart.',
+                                    );
+                                }
                             }
                         } else if (execution.errorCode === 'tools_offline' && execution.effectiveMode === 'default') {
                             this.hud.sendMessage({

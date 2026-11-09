@@ -28,6 +28,8 @@ export interface AccountSwitchResult {
     email?: string;
     message?: string;
     errorCode?: AccountSwitchErrorCode;
+    /** Whether the OS keyring was updated (macOS Keychain / Linux secret-tool / Windows wincred). */
+    keychainUpdated?: boolean;
 }
 
 export interface AccountSwitchOptions {
@@ -325,17 +327,23 @@ class AccountSwitchService {
             // The Language Server stores auth in Keychain (service=gemini, account=antigravity)
             // and IDE Settings reads id_token_email from it. Without this, IDE Settings
             // would continue showing the old account even after switch.
+            let keychainUpdated = false;
             try {
                 const { updateKeychainForAccountSwitch } = await import('../auto_trigger/keychain_service');
-                const keychainOk = await updateKeychainForAccountSwitch({
+                keychainUpdated = await updateKeychainForAccountSwitch({
                     accessToken,
                     refreshToken: credential.refreshToken,
                     email: resolvedEmail,
                     expirySeconds: Math.floor(expiryMs / 1000),
                 });
-                if (keychainOk) {
+                if (keychainUpdated) {
                     logger.info(
                         `[AccountSwitchService] Keychain updated for ${resolvedEmail}`,
+                    );
+                } else {
+                    logger.info(
+                        '[AccountSwitchService] Keychain not updated (platform=' + process.platform + '). ' +
+                        'Runtime token is active; window reload would lose it.',
                     );
                 }
             } catch (keychainError) {
@@ -346,13 +354,14 @@ class AccountSwitchService {
 
             await credentialStorage.setActiveAccount(resolvedEmail, true);
             logger.info(
-                `[AccountSwitchService] Seamless switch success: ${activeBefore ?? 'none'} -> ${resolvedEmail}`,
+                `[AccountSwitchService] Seamless switch success: ${activeBefore ?? 'none'} -> ${resolvedEmail}, keychainUpdated=${keychainUpdated}`,
             );
 
             return {
                 success: true,
                 mode,
                 email: resolvedEmail,
+                keychainUpdated,
             };
         } catch (error) {
             const err = error instanceof Error ? error.message : String(error);
